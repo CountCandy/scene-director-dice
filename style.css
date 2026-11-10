@@ -1,0 +1,218 @@
+/* Scene Director Dice */
+
+/* ------------------------------ HUD bar ------------------------------ */
+
+.sdd-hud {
+    display: flex;
+    justify-content: flex-start;
+    width: 100%;
+    padding: 2px 4px 4px;
+    box-sizing: border-box;
+    pointer-events: none;
+}
+
+.sdd-pill {
+    --sdd-accent: var(--SmartThemeQuoteColor, #7aa2f7);
+    display: inline-flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 10px;
+    max-width: 100%;
+    padding: 3px 6px 3px 10px;
+    border: 1px solid var(--SmartThemeBorderColor, rgba(128, 128, 128, 0.5));
+    border-left: 3px solid var(--sdd-accent);
+    border-radius: 999px;
+    background-color: var(--SmartThemeBlurTintColor, rgba(0, 0, 0, 0.6));
+    color: var(--SmartThemeBodyColor, #ddd);
+    font-size: 0.8em;
+    line-height: 1.4;
+    pointer-events: auto;
+}
+
+.sdd-pill[data-state="cooldown"] { --sdd-accent: #5fb3d9; }
+.sdd-pill[data-state="payoff"] { --sdd-accent: #e0b040; }
+.sdd-pill[data-state="paused"] { --sdd-accent: #999; }
+
+.sdd-hud-status {
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+.sdd-hud-last {
+    opacity: 0.75;
+    white-space: nowrap;
+}
+
+.sdd-hud-last[data-outcome="twist"] { color: #e07a6a; opacity: 1; }
+.sdd-hud-last[data-outcome="foreshadow"] { color: #e0b040; opacity: 1; }
+
+.sdd-hud-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+}
+
+.sdd-hud-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.9em;
+    height: 1.9em;
+    padding: 0;
+    border: 1px solid transparent;
+    border-radius: 50%;
+    background: transparent;
+    color: inherit;
+    font-size: 1em;
+    cursor: pointer;
+    opacity: 0.7;
+    transition: opacity 0.15s ease, background-color 0.15s ease;
+}
+
+.sdd-hud-btn:hover,
+.sdd-hud-btn:focus-visible {
+    opacity: 1;
+    background-color: rgba(128, 128, 128, 0.25);
+    outline: none;
+}
+
+.sdd-hud-btn.sdd-active {
+    opacity: 1;
+    color: #e0b040;
+    border-color: currentColor;
+}
+
+/* --------------------------- Settings drawer --------------------------- */
+
+.sdd-settings .sdd-heading {
+    margin: 14px 0 6px;
+    padding-bottom: 2px;
+    border-bottom: 1px solid var(--SmartThemeBorderColor, rgba(128, 128, 128, 0.5));
+}
+
+.sdd-settings label {
+    display: block;
+    margin-top: 6px;
+}
+
+.sdd-settings label.checkbox_label {
+    display: flex;
+    margin-top: 4px;
+}
+
+.sdd-flex {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    margin-top: 6px;
+}
+
+.sdd-flex .menu_button {
+    margin: 0;
+}
+
+.sdd-grow {
+    flex: 1 1 140px;
+    min-width: 0;
+}
+
+.sdd-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+    gap: 8px;
+}
+
+.sdd-hint {
+    display: block;
+    margin-top: 4px;
+    opacity: 0.7;
+}
+
+.sdd-settings textarea.text_pole {
+    width: 100%;
+    resize: vertical;
+    box-sizing: border-box;
+}
+
+/* Roll table editor */
+
+.sdd-table-head {
+    display: flex;
+    gap: 12px;
+    margin-top: 12px;
+    font-size: 0.8em;
+    opacity: 0.7;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.sdd-rows {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 4px;
+}
+
+.sdd-table-row {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    grid-template-areas:
+        "range type del"
+        "text  text text";
+    align-items: center;
+    gap: 4px 6px;
+    padding: 6px;
+    border: 1px solid var(--SmartThemeBorderColor, rgba(128, 128, 128, 0.5));
+    border-left: 3px solid #888;
+    border-radius: 6px;
+}
+
+.sdd-table-row[data-type="foreshadow"] { border-left-color: #e0b040; }
+.sdd-table-row[data-type="twist"] { border-left-color: #e07a6a; }
+
+.sdd-range {
+    grid-area: range;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.sdd-table-row .sdd-num {
+    width: 4.2em;
+    margin: 0;
+    text-align: center;
+}
+
+.sdd-table-row .sdd-type {
+    grid-area: type;
+    min-width: 0;
+    margin: 0;
+}
+
+.sdd-table-row .sdd-text {
+    grid-area: text;
+    margin: 0;
+}
+
+.sdd-table-row .sdd-del {
+    grid-area: del;
+    margin: 0;
+}
+
+.sdd-warning {
+    display: none;
+    margin-top: 6px;
+    padding: 6px 8px;
+    border: 1px solid #e0b040;
+    border-radius: 6px;
+    font-size: 0.85em;
+}
+
+.sdd-readout {
+    padding: 6px 8px;
+    border: 1px dashed var(--SmartThemeBorderColor, rgba(128, 128, 128, 0.5));
+    border-radius: 6px;
+    font-size: 0.85em;
+    overflow-wrap: anywhere;
+}

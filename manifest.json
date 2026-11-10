@@ -1,0 +1,13 @@
+{
+    "display_name": "Scene Director Dice",
+    "loading_order": 100,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "Scene Director Dice",
+    "version": "1.0.0",
+    "homePage": "",
+    "auto_update": false,
+    "generate_interceptor": "sceneDirectorDiceInterceptor"
+}
