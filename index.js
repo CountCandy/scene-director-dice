@@ -107,7 +107,20 @@ const defaultSettings = Object.freeze({
 });
 
 // Runtime info about the generation currently in flight (never persisted).
-const gen = { active: false, type: null };
+const gen = {
+    active: false,
+    type: null,
+    prefillLine: null,      // exact "- Director [...]:" line added in Mode B
+    interceptorSeen: false, // prompt assembly was reached for this generation
+    groupRound: null,       // { resolved } while a group chat round is running
+    laterMember: false,     // this generation is a later character in that round
+    watchdog: null,
+    token: 0,
+};
+
+const HISTORY_LIMIT = 30;
+const WATCHDOG_MS = 15000;
+let warnedUnparsedReasoning = false;
 
 /* -------------------------------------------------------------------------- */
 /* Helpers                                                                    */
@@ -239,6 +252,7 @@ function defaultState() {
         pendingPayoff: null,
         lastRollData: null,
         currentTurn: null,
+        history: [], // earlier turns, newest last, so deleted messages can be rewound
         paused: false,
     };
 }
@@ -263,6 +277,7 @@ function getState() {
     state.cooldownRemaining = clampInt(state.cooldownRemaining, 0, 999, 0);
     state.tensionBonus = clampInt(state.tensionBonus, 0, 999, 0);
     state.paused = Boolean(state.paused);
+    if (!Array.isArray(state.history)) state.history = [];
     return state;
 }
 
@@ -329,14 +344,63 @@ function applyRoll(state, settings, deck, raw) {
     return { kind: 'roll', die, raw, bonus, total, outcome, directive, chained, sig: deckSignature(deck) };
 }
 
-/** Puts cooldown / tension / payoff back to how they were before `turn` was resolved. */
-function rewindTurn(state, turn) {
+/** The parts of the per-chat state that a turn can change. */
+function snapshotState(state) {
+    return {
+        cooldownRemaining: state.cooldownRemaining,
+        tensionBonus: state.tensionBonus,
+        pendingPayoff: clone(state.pendingPayoff) ?? null,
+        lastRollData: clone(state.lastRollData) ?? null,
+    };
+}
+
+/**
+ * Puts the state back to how it was before `turn` was resolved. With
+ * `keepManual`, cooldown adjustments made by hand since then are kept.
+ */
+function rewindTurn(state, turn, { keepManual = true } = {}) {
     if (!turn || !turn.pre) return;
-    // Keep manual cooldown adjustments made since the turn was resolved.
-    const manualDelta = state.cooldownRemaining - (turn.postCooldown ?? state.cooldownRemaining);
+    const manualDelta = keepManual
+        ? state.cooldownRemaining - (turn.postCooldown ?? state.cooldownRemaining)
+        : 0;
     state.cooldownRemaining = Math.max(0, turn.pre.cooldownRemaining + manualDelta);
     state.tensionBonus = turn.pre.tensionBonus;
     state.pendingPayoff = clone(turn.pre.pendingPayoff) ?? null;
+    if (Object.hasOwn(turn.pre, 'lastRollData')) {
+        state.lastRollData = clone(turn.pre.lastRollData) ?? null;
+    }
+}
+
+/**
+ * Brings the turn record in line with the chat as it is now:
+ * - turns whose messages were deleted are undone, newest first, restoring the
+ *   cooldown / tension / payoff they had changed;
+ * - a turn whose reply was deleted (its user message is still there) becomes
+ *   undelivered again, so the next generation reuses its roll.
+ * Returns true if anything changed.
+ */
+function reconcileWithChat(state) {
+    const chat = getCtx().chat ?? [];
+    let changed = false;
+
+    let turn = state.currentTurn;
+    while (turn && turn.delivered && typeof turn.lenAtStart === 'number' && chat.length <= turn.lenAtStart) {
+        rewindTurn(state, turn, { keepManual: false });
+        turn = state.history.pop() ?? null;
+        state.currentTurn = turn;
+        changed = true;
+    }
+
+    // "Shorter than when the reply was there, and now ending on the user's
+    // message" means the reply was deleted, not that a new message arrived.
+    if (turn && turn.delivered && typeof turn.lenDelivered === 'number' && chat.length < turn.lenDelivered) {
+        const last = chat[chat.length - 1];
+        if (!last || last.is_user) {
+            turn.delivered = false;
+            changed = true;
+        }
+    }
+    return changed;
 }
 
 /**
@@ -353,11 +417,7 @@ function syncCachedTurn(state, settings) {
     if (prev.sig === deckSignature(deck)) return prev;
 
     rewindTurn(state, prev);
-    const pre = {
-        cooldownRemaining: state.cooldownRemaining,
-        tensionBonus: state.tensionBonus,
-        pendingPayoff: clone(state.pendingPayoff) ?? null,
-    };
+    const pre = snapshotState(state);
     const die = clampInt(deck.dieSize, 2, 1000, 10);
     const raw = prev.die === die && prev.raw >= 1 && prev.raw <= die ? prev.raw : rollDie(die);
     const turn = applyRoll(state, settings, deck, raw);
@@ -365,8 +425,28 @@ function syncCachedTurn(state, settings) {
     turn.postCooldown = state.cooldownRemaining;
     turn.delivered = Boolean(prev.delivered);
     turn.lenAtStart = prev.lenAtStart ?? null;
+    turn.lenDelivered = prev.lenDelivered;
+    turn.rerollPending = Boolean(prev.rerollPending);
     state.currentTurn = turn;
     return turn;
+}
+
+/**
+ * Returns the cached turn for another generation of the same turn (swipe,
+ * regenerate, retry, later group member). A turn that was cached while paused
+ * is resolved for real once rolling is unpaused.
+ */
+function reuseTurn(state, settings) {
+    const prev = state.currentTurn;
+    if (!prev) return resolveNewTurn(state, settings);
+    if (prev.kind === 'paused' && !state.paused) {
+        const turn = resolveNewTurn(state, settings);
+        turn.delivered = Boolean(prev.delivered);
+        turn.lenAtStart = prev.lenAtStart ?? null;
+        turn.lenDelivered = prev.lenDelivered;
+        return turn;
+    }
+    return syncCachedTurn(state, settings);
 }
 
 /**
@@ -376,11 +456,7 @@ function syncCachedTurn(state, settings) {
  */
 function resolveNewTurn(state, settings, { forceRoll = false } = {}) {
     const deck = getActiveDeck();
-    const pre = {
-        cooldownRemaining: state.cooldownRemaining,
-        tensionBonus: state.tensionBonus,
-        pendingPayoff: clone(state.pendingPayoff) ?? null,
-    };
+    const pre = snapshotState(state);
     let turn;
 
     if (state.paused && !forceRoll) {
@@ -420,14 +496,14 @@ function resolveNewTurn(state, settings, { forceRoll = false } = {}) {
  */
 function refreshDelivered(state) {
     const turn = state.currentTurn;
-    if (!turn || turn.delivered || turn.lenAtStart === null || turn.lenAtStart === undefined) return false;
+    if (!turn || typeof turn.lenAtStart !== 'number') return false;
     const chat = getCtx().chat ?? [];
     const last = chat[chat.length - 1];
-    if (last && !last.is_user && chat.length > turn.lenAtStart) {
-        turn.delivered = true;
-        return true;
-    }
-    return false;
+    if (!last || last.is_user || chat.length <= turn.lenAtStart) return false;
+    if (turn.delivered && turn.lenDelivered === chat.length) return false;
+    turn.delivered = true;
+    turn.lenDelivered = chat.length; // how long the chat was with this turn's replies in it
+    return true;
 }
 
 function describeTurn(turn) {
@@ -467,7 +543,7 @@ function buildDirectorLabel(turn) {
     }
 }
 
-function buildPromptText(turn, settings, usePrefill) {
+function buildPromptText(turn, settings, { usePrefill = false, isContinue = false, laterMember = false } = {}) {
     const lines = ['[Scene Director - applies to THIS reply only]'];
 
     if (turn.kind === 'roll') {
@@ -487,9 +563,17 @@ function buildPromptText(turn, settings, usePrefill) {
         lines.push(`Directive: ${turn.directive}`);
     }
 
+    const isDevelopment = turn.kind === 'payoff' || (turn.kind === 'roll' && turn.outcome !== 'steady');
+    if (laterMember && isDevelopment) {
+        lines.push('Other characters have already replied in this round under this same directive. If one of them has already carried it out, build on what they did instead of introducing another development.');
+    }
+
     const tag = settings.reasoningTag.trim();
     const where = tag ? `inside your ${tag} reasoning block` : 'in your reasoning';
-    if (usePrefill) {
+    if (isContinue) {
+        // The reply is already mid-prose: no reasoning line, and no doing it twice.
+        lines.push('This generation continues a reply that is already in progress. If the text so far has already carried out this directive, do not repeat it; otherwise keep following it. Do not write a "- Director:" line or any note about the directive. Just continue the prose.');
+    } else if (usePrefill) {
         lines.push(`Your reasoning already opens with a "- Director [...]:" line. Complete that line by evaluating how this directive applies to the current scene, continue reasoning as usual, then write the reply accordingly.`);
     } else {
         lines.push(`Before writing any prose, ${where}, write one line beginning with "- Director:" that evaluates how this directive applies to the current scene. Then write the reply accordingly.`);
@@ -497,6 +581,65 @@ function buildPromptText(turn, settings, usePrefill) {
     lines.push('Never mention the die, the roll, or the Director in the visible reply.');
 
     return lines.join('\n');
+}
+
+/**
+ * Mode B: SillyTavern stores the reply prefix as part of the reply. If the
+ * reasoning block was not split off into hidden reasoning, the Director line
+ * (with the roll and outcome) would stay in the message and be sent back to the
+ * model on later turns. Strip the roll label from whatever stays in context.
+ */
+function scrubDirectorLine() {
+    const line = gen.prefillLine;
+    if (!line) return;
+
+    const ctx = getCtx();
+    const chat = ctx.chat ?? [];
+    const id = chat.length - 1;
+    const message = chat[id];
+    if (!message || message.is_user) return;
+
+    const neutral = '- Director:';
+    const strip = text => text.split(line).join(neutral);
+    let changed = false;
+    let leftInText = false;
+
+    if (typeof message.mes === 'string' && message.mes.includes(line)) {
+        message.mes = strip(message.mes);
+        changed = true;
+        leftInText = true;
+    }
+    if (Array.isArray(message.swipes) && typeof message.swipe_id === 'number') {
+        const swipe = message.swipes[message.swipe_id];
+        if (typeof swipe === 'string' && swipe.includes(line)) {
+            message.swipes[message.swipe_id] = strip(swipe);
+            changed = true;
+        }
+    }
+    // Hidden reasoning keeps the label for the user to read, unless reasoning
+    // is itself sent back to the model.
+    if (ctx.powerUserSettings?.reasoning?.add_to_prompts
+        && typeof message.extra?.reasoning === 'string'
+        && message.extra.reasoning.includes(line)) {
+        message.extra.reasoning = strip(message.extra.reasoning);
+        changed = true;
+    }
+    if (!changed) return;
+
+    // Already on screen (streaming, swipe): redraw and save the corrected text.
+    try {
+        if (typeof document !== 'undefined' && document.querySelector?.(`#chat .mes[mesid="${id}"]`)) {
+            if (typeof ctx.updateMessageBlock === 'function') ctx.updateMessageBlock(id, message);
+            if (typeof ctx.saveChat === 'function') ctx.saveChat();
+        }
+    } catch (error) {
+        console.warn(LOG_PREFIX, 'Could not refresh the message after removing the Director label', error);
+    }
+
+    if (leftInText && !warnedUnparsedReasoning) {
+        warnedUnparsedReasoning = true;
+        notify('warning', 'Mode B: the reasoning block was not separated from the reply, so it stayed in the message (the roll label was removed). Turn on Reasoning auto-parse with a prefix and suffix that match your model, or use Mode A.');
+    }
 }
 
 function clearPrompt() {
@@ -546,22 +689,23 @@ function applyPrefill(turn, settings) {
     const line = `- Director [${label}]:`;
     const tag = settings.reasoningTag.trim();
 
-    let applied;
-    if (tag && settings.autoOpenTag && !base.includes(tag)) {
-        applied = `${tag}\n${line}`;
-    } else if (!base.trim()) {
-        applied = line;
-    } else {
-        const trimmed = base.replace(/[ \t]+$/, '');
-        applied = `${trimmed}${trimmed.endsWith('\n') ? '' : '\n'}${line}`;
-    }
+    // The user's own prefix is always kept and comes first.
+    const trimmed = base.replace(/[ \t]+$/, '');
+    const lead = trimmed.trim() ? `${trimmed}${trimmed.endsWith('\n') ? '' : '\n'}` : '';
+    const opener = tag && settings.autoOpenTag && !base.includes(tag) ? `${tag}\n` : '';
+    const applied = `${lead}${opener}${line}`;
 
     settings.prefillBackup = { base, applied };
     powerUser.user_prompt_bias = applied;
+    gen.prefillLine = line;
 }
 
 function applyPrompt(turn, settings, type) {
-    const text = buildPromptText(turn, settings, shouldUsePrefill(settings, type));
+    const text = buildPromptText(turn, settings, {
+        usePrefill: shouldUsePrefill(settings, type),
+        isContinue: type === 'continue',
+        laterMember: gen.laterMember,
+    });
     getCtx().setExtensionPrompt(PROMPT_KEY, text, EXT_PROMPT_IN_CHAT, 0, false, EXT_ROLE_SYSTEM);
 }
 
@@ -580,6 +724,35 @@ function isInjectable(turn, state) {
     return Boolean(turn) && turn.kind !== 'paused' && !state.paused;
 }
 
+function stopWatchdog() {
+    if (gen.watchdog) clearTimeout(gen.watchdog);
+    gen.watchdog = null;
+}
+
+/**
+ * SillyTavern only announces the end of a generation that got as far as showing
+ * the stop button. If it bailed out before that (server unreachable, for
+ * example), nothing tells us, so check once and clean up after ourselves.
+ */
+function startWatchdog() {
+    stopWatchdog();
+    const token = ++gen.token;
+    gen.watchdog = setTimeout(() => {
+        gen.watchdog = null;
+        if (!gen.active || gen.token !== token || gen.interceptorSeen) return;
+        const stopButton = typeof document !== 'undefined' ? document.getElementById('mes_stop') : null;
+        if (!stopButton || typeof getComputedStyle !== 'function') return;
+        if (getComputedStyle(stopButton).display === 'none') finishGeneration();
+    }, WATCHDOG_MS);
+    if (typeof gen.watchdog?.unref === 'function') gen.watchdog.unref();
+}
+
+/** A tool call makes SillyTavern generate again within the same reply. */
+function isToolFollowUp(chat) {
+    const last = chat[chat.length - 1];
+    return Boolean(last && last.is_system && Array.isArray(last.extra?.tool_invocations));
+}
+
 /**
  * Runs once at the start of every real generation (GENERATION_AFTER_COMMANDS),
  * which is early enough for the reasoning prefill to be picked up.
@@ -589,30 +762,55 @@ function prepareGeneration(rawType) {
     if (kind === 'ignore') return; // quiet / impersonate: no roll, no cooldown change
 
     cleanupInjection(); // drop anything stale from an interrupted generation
+    stopWatchdog();
     gen.active = false;
     gen.type = null;
+    gen.prefillLine = null;
+    gen.interceptorSeen = false;
+    gen.laterMember = false;
 
     const settings = getSettings();
     if (!settings.enabled) return;
 
     const ctx = getCtx();
+    const chat = ctx.chat ?? [];
     const state = getState();
     const type = String(rawType || 'normal').toLowerCase();
+
+    reconcileWithChat(state);
     let turn = state.currentTurn;
 
-    if (kind === 'retry') {
-        // Swipe / regenerate / continue: reuse the cached roll. It is only
-        // re-read if the table itself was edited since.
-        turn = turn ? syncCachedTurn(state, settings) : resolveNewTurn(state, settings);
+    // Still the same turn: another character in the same group round, or the
+    // follow-up generation after a tool call.
+    const laterMember = Boolean(gen.groupRound && gen.groupRound.resolved);
+    const sameRound = kind === 'normal' && Boolean(turn) && (laterMember || isToolFollowUp(chat));
+
+    if (kind === 'retry' || sameRound) {
+        // Reuse the cached roll. It is only re-read if the table was edited since.
+        turn = reuseTurn(state, settings);
+        gen.laterMember = sameRound && laterMember;
     } else {
         refreshDelivered(state);
-        if (!turn || turn.delivered) {
+        turn = state.currentTurn;
+        if (!turn) {
+            turn = resolveNewTurn(state, settings);
+        } else if (turn.delivered && turn.rerollPending) {
+            // Rerolled but never swiped: the reroll becomes this new turn's result.
+            turn = reuseTurn(state, settings);
+            turn.delivered = false;
+        } else if (turn.delivered) {
+            state.history.push(turn);
+            if (state.history.length > HISTORY_LIMIT) state.history.splice(0, state.history.length - HISTORY_LIMIT);
             turn = resolveNewTurn(state, settings);
         } else {
-            turn = syncCachedTurn(state, settings); // retry of a failed generation
+            turn = reuseTurn(state, settings); // retry of a failed generation
         }
-        turn.lenAtStart = (ctx.chat ?? []).length;
+        // Anchor the turn at its user message (or where the reply will go).
+        const last = chat[chat.length - 1];
+        turn.lenAtStart = chat.length - (last && last.is_user ? 1 : 0);
+        if (gen.groupRound) gen.groupRound.resolved = true;
     }
+    turn.rerollPending = false;
 
     gen.active = true;
     gen.type = type;
@@ -622,6 +820,7 @@ function prepareGeneration(rawType) {
         if (shouldUsePrefill(settings, type)) applyPrefill(turn, settings);
         applyPrompt(turn, settings, type);
     }
+    startWatchdog();
     updateUi();
 }
 
@@ -642,10 +841,9 @@ function onGenerationAfterCommands(type, _options, dryRun) {
 globalThis.sceneDirectorDiceInterceptor = async function (_chat, _contextSize, _abort, type) {
     try {
         if (classifyType(type) === 'ignore') return;
-        if (!gen.active) {
-            prepareGeneration(type);
-            return;
-        }
+        if (!gen.active) prepareGeneration(type);
+        gen.interceptorSeen = true;
+        if (!gen.active) return;
         const settings = getSettings();
         const state = getState();
         if (settings.enabled && isInjectable(state.currentTurn, state)) {
@@ -657,7 +855,9 @@ globalThis.sceneDirectorDiceInterceptor = async function (_chat, _contextSize, _
 };
 
 function finishGeneration() {
+    stopWatchdog();
     try {
+        scrubDirectorLine();
         const state = getState();
         if (refreshDelivered(state)) saveState();
         cleanupInjection();
@@ -666,14 +866,28 @@ function finishGeneration() {
     }
     gen.active = false;
     gen.type = null;
+    gen.prefillLine = null;
+    gen.laterMember = false;
     updateUi();
 }
 
 function onChatChanged() {
+    stopWatchdog();
     cleanupInjection();
     gen.active = false;
     gen.type = null;
-    getState();
+    gen.prefillLine = null;
+    gen.laterMember = false;
+    gen.groupRound = null;
+    // A branch or checkpoint can open with fewer messages than the state covers.
+    if (reconcileWithChat(getState())) saveState();
+    updateUi();
+}
+
+function onMessageDeleted() {
+    // Regenerate deletes the old reply mid-generation; that is not a rewind.
+    if (gen.active) return;
+    if (reconcileWithChat(getState())) saveState();
     updateUi();
 }
 
@@ -718,13 +932,17 @@ async function rerollCurrentTurn() {
     }
 
     const turn = resolveNewTurn(state, settings, { forceRoll });
-    // The new result replaces the cached one for the same turn slot.
+    // The new result replaces the cached one for the same turn slot. If that
+    // turn was already answered, the result waits for the next generation:
+    // a swipe redoes the reply with it, a new message takes it as its own.
     turn.delivered = prev ? Boolean(prev.delivered) : false;
     turn.lenAtStart = prev ? (prev.lenAtStart ?? null) : null;
+    turn.lenDelivered = prev ? prev.lenDelivered : undefined;
+    turn.rerollPending = turn.delivered;
 
     saveState();
     updateUi();
-    notify('info', `Current turn: ${describeTurn(turn)}`);
+    notify('info', `${describeTurn(turn)}. Used by your next swipe or message.`);
 }
 
 function togglePause() {
@@ -918,9 +1136,9 @@ const SETTINGS_HTML = `
             </datalist>
             <label class="checkbox_label" for="sdd-auto-open">
                 <input type="checkbox" id="sdd-auto-open">
-                <span>Mode B: open the reasoning tag if Start Reply With does not already contain it</span>
+                <span>Mode B: open the reasoning tag (after your own Start Reply With text) if that text does not already contain it</span>
             </label>
-            <small class="sdd-hint">Mode B temporarily extends Start Reply With for one generation and restores it afterwards. It needs a backend that honors a reply prefill; use Mode A otherwise.</small>
+            <small class="sdd-hint">Mode B temporarily extends Start Reply With for one generation and restores it afterwards. It needs a backend that honors a reply prefill, and SillyTavern's Reasoning auto-parse set to your model's tags so the reasoning is split off from the reply; use Mode A otherwise.</small>
 
             <h4 class="sdd-heading">Directive wording</h4>
             <label for="sdd-cooldown-text">Cooldown / hold-steady directive</label>
@@ -937,6 +1155,21 @@ const SETTINGS_HTML = `
         </div>
     </div>
 </div>`;
+
+/**
+ * Number fields commit when the user leaves the field or presses Enter, not on
+ * every keystroke, so half-typed or cleared values are never saved. The field
+ * is then rewritten with the value actually stored.
+ */
+function bindNumberInput($input, min, max, getValue, setValue) {
+    $input.on('change', () => {
+        const raw = String($input.val() ?? '').trim();
+        if (raw !== '' && Number.isFinite(Number(raw))) {
+            setValue(clampInt(raw, min, max, getValue()));
+        }
+        $input.val(getValue());
+    });
+}
 
 function formatRanges(numbers) {
     const parts = [];
@@ -1004,17 +1237,17 @@ function renderRows() {
         const $text = $('<textarea class="text_pole sdd-text" rows="2" placeholder="Directive for the narrator"></textarea>').val(row.text);
         const $del = $('<div class="menu_button fa-solid fa-xmark sdd-del" title="Delete row"></div>');
 
-        $min.on('input', () => {
+        bindNumberInput($min, 1, 1000, () => liveRow()?.min ?? row.min, value => {
             const target = liveRow();
             if (!target) return;
-            target.min = clampInt($min.val(), 1, 1000, target.min);
+            target.min = value;
             saveSettings();
             renderWarning();
         });
-        $max.on('input', () => {
+        bindNumberInput($max, 1, 1000, () => liveRow()?.max ?? row.max, value => {
             const target = liveRow();
             if (!target) return;
-            target.max = clampInt($max.val(), 1, 1000, target.max);
+            target.max = value;
             saveSettings();
             renderWarning();
         });
@@ -1140,16 +1373,15 @@ function buildSettingsUi() {
         updateUi();
     });
 
-    $('#sdd-die').on('input', function () {
-        const deck = getActiveDeck();
-        deck.dieSize = clampInt($(this).val(), 2, 1000, deck.dieSize);
+    bindNumberInput($('#sdd-die'), 2, 1000, () => getActiveDeck().dieSize, value => {
+        getActiveDeck().dieSize = value;
         saveSettings();
         renderDeckSelect();
         renderWarning();
         updateUi();
     });
-    $('#sdd-cooldown').val(settings.cooldownTurns).on('input', function () {
-        getSettings().cooldownTurns = clampInt($(this).val(), 0, 50, 3);
+    bindNumberInput($('#sdd-cooldown').val(settings.cooldownTurns), 0, 50, () => getSettings().cooldownTurns, value => {
+        getSettings().cooldownTurns = value;
         saveSettings();
     });
 
@@ -1180,9 +1412,10 @@ function buildSettingsUi() {
         saveSettings();
         updateUi();
     });
-    $('#sdd-tension-max').val(settings.tensionMax).on('input', function () {
-        getSettings().tensionMax = clampInt($(this).val(), 1, 100, 3);
+    bindNumberInput($('#sdd-tension-max').val(settings.tensionMax), 1, 100, () => getSettings().tensionMax, value => {
+        getSettings().tensionMax = value;
         saveSettings();
+        updateUi();
     });
 
     $('#sdd-mode').val(settings.injectionMode).on('change', function () {
@@ -1226,6 +1459,8 @@ globalThis.SceneDirectorDice = {
     adjustCooldown,
     prepareGeneration,
     finishGeneration,
+    onMessageDeleted,
+    setGroupRound(active) { gen.groupRound = active ? { resolved: false } : null; },
 };
 
 jQuery(async () => {
@@ -1249,6 +1484,14 @@ jQuery(async () => {
     eventSource.on(eventTypes.MESSAGE_RECEIVED, () => {
         if (gen.active) finishGeneration();
     });
+    if (eventTypes.MESSAGE_DELETED) {
+        eventSource.on(eventTypes.MESSAGE_DELETED, onMessageDeleted);
+    }
+    // In a group chat every character generates separately; the whole round is one turn.
+    if (eventTypes.GROUP_WRAPPER_STARTED && eventTypes.GROUP_WRAPPER_FINISHED) {
+        eventSource.on(eventTypes.GROUP_WRAPPER_STARTED, () => { gen.groupRound = { resolved: false }; });
+        eventSource.on(eventTypes.GROUP_WRAPPER_FINISHED, () => { gen.groupRound = null; });
+    }
 
     onChatChanged();
     console.log(LOG_PREFIX, 'loaded');

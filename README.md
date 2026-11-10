@@ -37,6 +37,16 @@ The one exception is when you edit the table, change the die size, or switch dec
 
 Background ("quiet") generations from other extensions, such as summarizers and trackers, are ignored.
 
+### Group chats
+
+One round of a group chat is one turn. The die is rolled once when the round starts, and every character who replies in that round gets the same directive. Characters after the first are also told to build on a development another character has already introduced, so one Twist does not turn into three.
+
+### Deleting messages
+
+If you delete messages to back up in the story, the pacing backs up with you: the cooldown, tension, and queued payoff return to where they were before the deleted turns (up to the last 30 turns). If you delete only the reply and keep your own message, the next generation reuses that turn's roll.
+
+Deleting a message from the middle of the chat can leave this tracking off by one turn; use **Reset chat state** or the cooldown buttons to correct it.
+
 ## Installation
 
 ### From inside SillyTavern (recommended)
@@ -85,7 +95,7 @@ The pill above the message input shows the current state and the last roll:
 Its buttons:
 
 - **Lock**: pause or resume. While paused nothing is injected and the cooldown does not count down. Use it for scenes you do not want interrupted.
-- **Dice**: reroll the current turn. If the current turn is a cooldown or payoff turn, it asks before forcing a fresh roll.
+- **Dice**: reroll the current turn. The new result is used by your next generation: a swipe redoes the reply with it, and if you send a new message instead, that message takes it. If the current turn is a cooldown or payoff turn, it asks before forcing a fresh roll.
 - **Minus**: remove one cooldown turn. Shift+click clears the cooldown and any queued payoff.
 - **Plus**: add one cooldown turn.
 
@@ -95,6 +105,7 @@ Open the **Scene Director Dice** drawer in the Extensions panel.
 
 - **Deck**: pick the active roll table. Four decks are included: General Story, Social & Intrigue, Dungeon & Hazards, and Combat. You can add, rename, and delete decks.
 - **Die size**: set per deck, so switching decks also switches the die.
+- Number fields are saved when you leave the field or press Enter, not while typing.
 - **Cooldown turns**: how many turns to hold steady after a twist.
 - **Table editor**: each row has a min-max range, an outcome type, and directive text. A warning appears if any number on the die is uncovered or covered twice.
 - **Pacing**: the foreshadow chain toggle, the tension bonus toggle, and the tension cap.
@@ -116,7 +127,12 @@ Open the **Scene Director Dice** drawer in the Extensions panel.
 Both modes put the directive in the prompt as a system message at depth 0 (right after your latest message) and remove it when generation ends.
 
 - **Mode A: Depth-0 prompt + reasoning instruction.** The directive also asks the model to write a `- Director:` line in its reasoning block before the reply. This works with any backend and is the default.
-- **Mode B: Reasoning prefill.** In addition, the extension temporarily adds a line such as `- Director [1d10=8 - Twist]:` to SillyTavern's **Start Reply With** field, so the model begins its reasoning by completing that thought. Your own Start Reply With text is restored after each generation. This needs a backend that honors a reply prefill; if yours does not, use Mode A.
+- **Mode B: Reasoning prefill.** In addition, the extension temporarily adds a line such as `- Director [1d10=8 - Twist]:` to SillyTavern's **Start Reply With** field, so the model begins its reasoning by completing that thought. Your own Start Reply With text is kept in front of that line and restored after each generation. On a Continue, no reasoning line is requested, since the reply is already under way.
+
+Mode B has two requirements. If either is missing, use Mode A.
+
+1. A backend that honors a reply prefill.
+2. SillyTavern's **Reasoning auto-parse** turned on, with a prefix and suffix that match your model's reasoning tags. SillyTavern stores the reply prefix as part of the reply, so without auto-parse the reasoning block stays in the visible message. The extension removes the roll label from it either way, so past rolls are not sent back to the model, and warns you once.
 
 **Reasoning tag format** sets which tag the instructions refer to. It defaults to `<|channel>thought` (Gemma); `<think>` is offered as an alternative, and you can type any other tag.
 
