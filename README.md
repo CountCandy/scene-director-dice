@@ -33,6 +33,8 @@ With **Enable Tension Bonus** on, each Steady result adds +1 to the next roll, u
 
 Swiping or regenerating reuses the roll already made for that turn. It does not reroll and does not count down the cooldown, so you can swipe freely without breaking the pacing. If you want a different result, press **Reroll** first, then swipe.
 
+The one exception is when you edit the table, change the die size, or switch decks before swiping: the same die number is then read against the table as it is now, so your edit shows up on the swipe. If the number no longer fits on the new die, it rolls again.
+
 Background ("quiet") generations from other extensions, such as summarizers and trackers, are ignored.
 
 ## Installation

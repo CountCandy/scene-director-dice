@@ -171,11 +171,17 @@ async function askConfirm(message) {
 /* Settings (global) and state (per chat)                                     */
 /* -------------------------------------------------------------------------- */
 
-function sanitizeRow(row) {
-    const min = clampInt(row?.min, 1, 1000, 1);
-    const max = clampInt(row?.max, 1, 1000, min);
-    const type = Object.hasOwn(OUTCOME_LABEL, row?.type) ? row.type : 'steady';
-    return { min, max, type, text: String(row?.text ?? '') };
+/**
+ * Normalizes a row IN PLACE. The row objects must keep their identity: the
+ * settings are read on almost every action, and replacing the objects here
+ * would silently disconnect them from anything still holding a reference.
+ */
+function normalizeRow(row) {
+    row.min = clampInt(row.min, 1, 1000, 1);
+    row.max = clampInt(row.max, 1, 1000, row.min);
+    row.type = Object.hasOwn(OUTCOME_LABEL, row.type) ? row.type : 'steady';
+    row.text = String(row.text ?? '');
+    return row;
 }
 
 function getSettings() {
@@ -198,7 +204,12 @@ function getSettings() {
         if (!deck.id) deck.id = makeId();
         deck.name = String(deck.name ?? 'Untitled Deck');
         deck.dieSize = clampInt(deck.dieSize, 2, 1000, 10);
-        deck.rows = Array.isArray(deck.rows) ? deck.rows.map(sanitizeRow) : [];
+        if (!Array.isArray(deck.rows)) deck.rows = [];
+        for (let i = 0; i < deck.rows.length; i++) {
+            const row = deck.rows[i];
+            if (!row || typeof row !== 'object') deck.rows[i] = {};
+            normalizeRow(deck.rows[i]);
+        }
     }
     if (!settings.decks.some(d => d.id === settings.activeDeckId)) {
         settings.activeDeckId = settings.decks[0].id;
@@ -276,6 +287,88 @@ function findRow(deck, total) {
     return deck.rows.find(row => total >= row.min && total <= row.max) ?? null;
 }
 
+/** Short fingerprint of a deck's die and table, used to notice edits. */
+function deckSignature(deck) {
+    const text = JSON.stringify([deck.id, deck.dieSize, deck.rows.map(r => [r.min, r.max, r.type, r.text])]);
+    let hash = 5381;
+    for (let i = 0; i < text.length; i++) {
+        hash = ((hash << 5) + hash + text.charCodeAt(i)) | 0;
+    }
+    return `${text.length}:${hash >>> 0}`;
+}
+
+/**
+ * Reads a raw die result against the deck's current table, applies the
+ * outcome to the per-chat state, and returns the turn record.
+ */
+function applyRoll(state, settings, deck, raw) {
+    const die = clampInt(deck.dieSize, 2, 1000, 10);
+    const bonus = settings.tensionEnabled ? Math.min(state.tensionBonus, settings.tensionMax) : 0;
+    const total = Math.min(die, raw + bonus);
+    const row = findRow(deck, total);
+    const outcome = row ? row.type : 'steady';
+    const directive = (row && row.text.trim()) || FALLBACK_STEADY_TEXT;
+    let chained = false;
+
+    if (outcome === 'steady') {
+        state.tensionBonus = settings.tensionEnabled
+            ? Math.min(settings.tensionMax, state.tensionBonus + 1)
+            : 0;
+    } else if (outcome === 'foreshadow') {
+        state.tensionBonus = 0;
+        if (settings.chainEnabled) {
+            state.pendingPayoff = { directive, total };
+            chained = true;
+        }
+    } else {
+        state.tensionBonus = 0;
+        state.cooldownRemaining = settings.cooldownTurns;
+    }
+
+    state.lastRollData = { die, raw, bonus, total, outcome, deck: deck.name, at: Date.now() };
+    return { kind: 'roll', die, raw, bonus, total, outcome, directive, chained, sig: deckSignature(deck) };
+}
+
+/** Puts cooldown / tension / payoff back to how they were before `turn` was resolved. */
+function rewindTurn(state, turn) {
+    if (!turn || !turn.pre) return;
+    // Keep manual cooldown adjustments made since the turn was resolved.
+    const manualDelta = state.cooldownRemaining - (turn.postCooldown ?? state.cooldownRemaining);
+    state.cooldownRemaining = Math.max(0, turn.pre.cooldownRemaining + manualDelta);
+    state.tensionBonus = turn.pre.tensionBonus;
+    state.pendingPayoff = clone(turn.pre.pendingPayoff) ?? null;
+}
+
+/**
+ * If the die or table was edited (or another deck selected) after the cached
+ * roll was made, read the same die number against the table as it is now, so
+ * a swipe or retry reflects the edit. Rolls again only when the cached number
+ * no longer fits on the die. Cooldown and payoff turns have no roll to re-read.
+ */
+function syncCachedTurn(state, settings) {
+    const prev = state.currentTurn;
+    if (!prev || prev.kind !== 'roll') return prev;
+
+    const deck = getActiveDeck();
+    if (prev.sig === deckSignature(deck)) return prev;
+
+    rewindTurn(state, prev);
+    const pre = {
+        cooldownRemaining: state.cooldownRemaining,
+        tensionBonus: state.tensionBonus,
+        pendingPayoff: clone(state.pendingPayoff) ?? null,
+    };
+    const die = clampInt(deck.dieSize, 2, 1000, 10);
+    const raw = prev.die === die && prev.raw >= 1 && prev.raw <= die ? prev.raw : rollDie(die);
+    const turn = applyRoll(state, settings, deck, raw);
+    turn.pre = pre;
+    turn.postCooldown = state.cooldownRemaining;
+    turn.delivered = Boolean(prev.delivered);
+    turn.lenAtStart = prev.lenAtStart ?? null;
+    state.currentTurn = turn;
+    return turn;
+}
+
 /**
  * Resolves a brand-new turn and mutates the per-chat state accordingly.
  * Order of precedence: paused > queued payoff > cooldown > die roll.
@@ -308,32 +401,7 @@ function resolveNewTurn(state, settings, { forceRoll = false } = {}) {
         };
         state.cooldownRemaining -= 1;
     } else {
-        const die = clampInt(deck.dieSize, 2, 1000, 10);
-        const raw = rollDie(die);
-        const bonus = settings.tensionEnabled ? Math.min(state.tensionBonus, settings.tensionMax) : 0;
-        const total = Math.min(die, raw + bonus);
-        const row = findRow(deck, total);
-        const outcome = row ? row.type : 'steady';
-        const directive = (row && row.text.trim()) || FALLBACK_STEADY_TEXT;
-        let chained = false;
-
-        if (outcome === 'steady') {
-            state.tensionBonus = settings.tensionEnabled
-                ? Math.min(settings.tensionMax, state.tensionBonus + 1)
-                : 0;
-        } else if (outcome === 'foreshadow') {
-            state.tensionBonus = 0;
-            if (settings.chainEnabled) {
-                state.pendingPayoff = { directive, total };
-                chained = true;
-            }
-        } else {
-            state.tensionBonus = 0;
-            state.cooldownRemaining = settings.cooldownTurns;
-        }
-
-        turn = { kind: 'roll', die, raw, bonus, total, outcome, directive, chained };
-        state.lastRollData = { die, raw, bonus, total, outcome, deck: deck.name, at: Date.now() };
+        turn = applyRoll(state, settings, deck, rollDie(clampInt(deck.dieSize, 2, 1000, 10)));
     }
 
     turn.pre = pre;
@@ -533,12 +601,15 @@ function prepareGeneration(rawType) {
     let turn = state.currentTurn;
 
     if (kind === 'retry') {
-        // Swipe / regenerate / continue: reuse the cached turn untouched.
-        if (!turn) turn = resolveNewTurn(state, settings);
+        // Swipe / regenerate / continue: reuse the cached roll. It is only
+        // re-read if the table itself was edited since.
+        turn = turn ? syncCachedTurn(state, settings) : resolveNewTurn(state, settings);
     } else {
         refreshDelivered(state);
         if (!turn || turn.delivered) {
             turn = resolveNewTurn(state, settings);
+        } else {
+            turn = syncCachedTurn(state, settings); // retry of a failed generation
         }
         turn.lenAtStart = (ctx.chat ?? []).length;
     }
@@ -636,13 +707,8 @@ async function rerollCurrentTurn() {
         forceRoll = true;
     }
 
-    if (prev && prev.pre) {
-        // Undo what the cached turn did, keeping manual cooldown adjustments made since.
-        const manualDelta = state.cooldownRemaining - (prev.postCooldown ?? state.cooldownRemaining);
-        state.cooldownRemaining = Math.max(0, prev.pre.cooldownRemaining + manualDelta);
-        state.tensionBonus = prev.pre.tensionBonus;
-        state.pendingPayoff = clone(prev.pre.pendingPayoff) ?? null;
-    }
+    // Undo what the cached turn did before resolving it again.
+    rewindTurn(state, prev);
 
     if (forceRoll) {
         state.cooldownRemaining = 0;
@@ -924,6 +990,8 @@ function renderRows() {
     const $rows = $('#sdd-rows').empty();
 
     deck.rows.forEach((row, index) => {
+        // Always resolve the row from the live settings at edit time.
+        const liveRow = () => getActiveDeck().rows[index];
         const $row = $('<div class="sdd-table-row"></div>').attr('data-type', row.type);
 
         const $min = $('<input type="number" class="text_pole sdd-num" min="1" step="1" title="Range minimum">').val(row.min);
@@ -937,26 +1005,34 @@ function renderRows() {
         const $del = $('<div class="menu_button fa-solid fa-xmark sdd-del" title="Delete row"></div>');
 
         $min.on('input', () => {
-            row.min = clampInt($min.val(), 1, 1000, row.min);
+            const target = liveRow();
+            if (!target) return;
+            target.min = clampInt($min.val(), 1, 1000, target.min);
             saveSettings();
             renderWarning();
         });
         $max.on('input', () => {
-            row.max = clampInt($max.val(), 1, 1000, row.max);
+            const target = liveRow();
+            if (!target) return;
+            target.max = clampInt($max.val(), 1, 1000, target.max);
             saveSettings();
             renderWarning();
         });
         $type.on('change', () => {
-            row.type = String($type.val());
-            $row.attr('data-type', row.type);
+            const target = liveRow();
+            if (!target) return;
+            target.type = Object.hasOwn(OUTCOME_LABEL, String($type.val())) ? String($type.val()) : 'steady';
+            $row.attr('data-type', target.type);
             saveSettings();
         });
         $text.on('input', () => {
-            row.text = String($text.val());
+            const target = liveRow();
+            if (!target) return;
+            target.text = String($text.val());
             saveSettings();
         });
         $del.on('click', () => {
-            deck.rows.splice(index, 1);
+            getActiveDeck().rows.splice(index, 1);
             saveSettings();
             renderRows();
         });
